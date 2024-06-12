@@ -186,10 +186,30 @@ static int http_server_worker(void *arg)
     return 0;
 }
 
+// if success run, return 1, otherwise return 0
+int handle_socket(void *arg)
+{
+    char *buf;
+    buf = kzalloc(1, GFP_KERNEL);
+    if (!buf) {
+        pr_err("can't allocate memory!\n");
+        return -1;
+    }
+
+    kfree(buf);
+
+    struct task_struct *worker =
+        kthread_run(http_server_worker, arg, KBUILD_MODNAME);
+    if (IS_ERR(worker))
+        return 0;
+
+    return 1;
+}
+
 int http_server_daemon(void *arg)
 {
     struct socket *socket;
-    struct task_struct *worker;
+    // struct task_struct *worker;
     struct http_server_param *param = (struct http_server_param *) arg;
 
     allow_signal(SIGKILL);
@@ -203,11 +223,19 @@ int http_server_daemon(void *arg)
             pr_err("kernel_accept() error: %d\n", err);
             continue;
         }
-        worker = kthread_run(http_server_worker, socket, KBUILD_MODNAME);
+
+        if (!handle_socket(socket)) {
+            pr_err("can't create more worker process to handle this socket\n");
+            continue;
+        }
+
+        // worker = kthread_run(http_server_worker, socket, KBUILD_MODNAME);
+        /*
         if (IS_ERR(worker)) {
             pr_err("can't create more worker process\n");
             continue;
         }
+        */
     }
     return 0;
 }
