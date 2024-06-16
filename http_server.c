@@ -189,20 +189,10 @@ static int http_server_worker(void *arg)
 // if success run, return 1, otherwise return 0
 int handle_socket(void *arg)
 {
-    char *buf;
-    buf = kzalloc(1, GFP_KERNEL);
-    if (!buf) {
-        pr_err("can't allocate memory!\n");
-        return -1;
-    }
-
-    kfree(buf);
-
     struct task_struct *worker =
         kthread_run(http_server_worker, arg, KBUILD_MODNAME);
     if (IS_ERR(worker))
         return 0;
-
     return 1;
 }
 
