@@ -23,7 +23,7 @@ b.attach_kprobe(event = event_function, fn_name = 'probe_handler')
 b.attach_kretprobe(event = event_function, fn_name = 'end_function')
 
 
-filename = 'kthread_run_cost.txt'
+filename = 'cmwq_run_cost.txt'
 with open(filename, 'w') as file:
     while True:
         try:

@@ -3,6 +3,7 @@
 #include <linux/kthread.h>
 #include <linux/sched/signal.h>
 #include <linux/tcp.h>
+#include <linux/workqueue.h>
 
 #include "http_parser.h"
 #include "http_server.h"
@@ -31,6 +32,11 @@
     "Connection: KeepAlive" CRLF CRLF "501 Not Implemented" CRLF
 
 #define RECV_BUFFER_SIZE 4096
+
+struct request_handler {
+    struct work_struct w;
+    void *socket;
+};
 
 struct http_request {
     struct socket *socket;
@@ -141,6 +147,7 @@ static int http_parser_callback_message_complete(http_parser *parser)
     return 0;
 }
 
+/* kthread version
 static int http_server_worker(void *arg)
 {
     char *buf;
@@ -185,19 +192,90 @@ static int http_server_worker(void *arg)
     kfree(buf);
     return 0;
 }
+*/
+
+/*
+CMWQ version
+*/
+static void http_server_worker(struct work_struct *w)
+{
+    struct request_handler *handler =
+        container_of(w, struct request_handler, w);
+
+    char *buf;
+    struct http_parser parser;
+    struct http_parser_settings setting = {
+        .on_message_begin = http_parser_callback_message_begin,
+        .on_url = http_parser_callback_request_url,
+        .on_header_field = http_parser_callback_header_field,
+        .on_header_value = http_parser_callback_header_value,
+        .on_headers_complete = http_parser_callback_headers_complete,
+        .on_body = http_parser_callback_body,
+        .on_message_complete = http_parser_callback_message_complete};
+    struct http_request request;
+    struct socket *socket = (struct socket *) handler->socket;
+
+    allow_signal(SIGKILL);
+    allow_signal(SIGTERM);
+
+    buf = kzalloc(RECV_BUFFER_SIZE, GFP_KERNEL);
+    if (!buf) {
+        pr_err("can't allocate memory!\n");
+        // return -1;
+    }
+
+    request.socket = socket;
+    http_parser_init(&parser, HTTP_REQUEST);
+    parser.data = &request;
+    while (1) {
+        int ret = http_server_recv(socket, buf, RECV_BUFFER_SIZE - 1);
+        if (ret <= 0) {
+            if (ret)
+                pr_err("recv error: %d\n", ret);
+            break;
+        }
+        http_parser_execute(&parser, &setting, buf, ret);
+        if (request.complete && !http_should_keep_alive(&parser))
+            break;
+        memset(buf, 0, RECV_BUFFER_SIZE);
+    }
+    kernel_sock_shutdown(socket, SHUT_RDWR);
+    sock_release(socket);
+    kfree(buf);
+    kfree(handler);
+    // return 0;
+}
 
 // if success run, return 1, otherwise return 0
-int handle_socket(void *arg)
+int handle_client_request(void *arg, struct workqueue_struct *workqueue)
 {
+    struct request_handler *handler =
+        kmalloc(sizeof(struct request_handler), GFP_KERNEL);
+    handler->socket = arg;
+    INIT_WORK(&handler->w, http_server_worker);
+    if (queue_work(workqueue, &handler->w) == 0) {
+        pr_err("work was already on a queue.");
+        return 0;
+    }
+    return 1;
+
+    /*
     struct task_struct *worker =
         kthread_run(http_server_worker, arg, KBUILD_MODNAME);
-    if (IS_ERR(worker))
+    if (IS_ERR(worker)){
+        pr_err("can't create more worker process\n");
         return 0;
+    }
     return 1;
+    */
 }
 
 int http_server_daemon(void *arg)
 {
+    struct workqueue_struct *workqueue =
+        alloc_workqueue("khttp", 0, WQ_MAX_ACTIVE);
+
+
     struct socket *socket;
     // struct task_struct *worker;
     struct http_server_param *param = (struct http_server_param *) arg;
@@ -214,8 +292,9 @@ int http_server_daemon(void *arg)
             continue;
         }
 
-        if (!handle_socket(socket)) {
-            pr_err("can't create more worker process to handle this socket\n");
+        if (!handle_client_request(socket, workqueue)) {
+            pr_err(
+                "can't create more worker process to handle client request\n");
             continue;
         }
 
@@ -227,5 +306,6 @@ int http_server_daemon(void *arg)
         }
         */
     }
+    destroy_workqueue(workqueue);
     return 0;
 }
