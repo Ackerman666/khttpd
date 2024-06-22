@@ -1,6 +1,6 @@
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
-#include <linux/dcache.h>
+
 #include <linux/fs.h>
 #include <linux/fs_struct.h>
 #include <linux/kthread.h>
@@ -10,6 +10,7 @@
 
 #include "http_parser.h"
 #include "http_server.h"
+#include "mime_type.h"
 
 #define CRLF "\r\n"
 
@@ -18,17 +19,19 @@
     "HTTP/1.1 200 OK" CRLF "Server: " KBUILD_MODNAME CRLF     \
     "Content-Type: text/plain" CRLF "Content-Length: 12" CRLF \
     "Connection: Close" CRLF CRLF "Hello World!" CRLF
-#define HTTP_RESPONSE_200_KEEPALIVE_DUMMY                     \
-    ""                                                        \
-    "HTTP/1.1 200 OK" CRLF "Server: " KBUILD_MODNAME CRLF     \
-    "Content-Type: text/plain" CRLF "Content-Length: 12" CRLF \
-    "Connection: Keep-Alive" CRLF CRLF "Hello World!" CRLF
 
-#define HTTP_RESPONSE_200_KEEPALIVE_HTML                  \
+#define HTTP_RESPONSE_200_KEEPALIVE                       \
     ""                                                    \
     "HTTP/1.1 200 OK" CRLF "Server: " KBUILD_MODNAME CRLF \
-    "Connection: Keep-Alive" CRLF "Hello World!" CRLF     \
-    "Keep-Alive: timeout=5" CRLF "Content-Type: text/html" CRLF CRLF
+    "Content-Type: %s" CRLF "Content-Length: %d" CRLF     \
+    "Connection: Close" CRLF CRLF
+
+#define HTTP_RESPONSE_200_CHUNKED_KEEPALIVE                   \
+    ""                                                        \
+    "HTTP/1.1 200 OK" CRLF "Server: " KBUILD_MODNAME CRLF     \
+    "Content-Type: %s" CRLF "Transfer-Encoding: chunked" CRLF \
+    "Connection: Keep-Alive" CRLF CRLF
+
 
 
 #define HTTP_RESPONSE_501                                              \
@@ -42,8 +45,15 @@
     "Content-Type: text/plain" CRLF "Content-Length: 21" CRLF          \
     "Connection: KeepAlive" CRLF CRLF "501 Not Implemented" CRLF
 
+#define HTTP_RESPONSE_404                                        \
+    ""                                                           \
+    "HTTP/1.1 404 Not Found" CRLF "Server: " KBUILD_MODNAME CRLF \
+    "Content-Type: text/plain" CRLF "Content-Length: 13" CRLF    \
+    "Connection: Close" CRLF CRLF "404 Not Found" CRLF
+
 #define RECV_BUFFER_SIZE 4096
 #define SEND_BUFFER_SIZE 4096
+
 
 
 struct dir_tracer {
@@ -112,11 +122,25 @@ static bool trace_directory(struct dir_context *dir_context,
     if (strcmp(name, ".") && strcmp(name, "..")) {
         struct dir_tracer *tracer =
             container_of(dir_context, struct dir_tracer, dir_context);
+
+
         char buf[SEND_BUFFER_SIZE] = {0};
+        char chunk_header[10] = {0};
+        unsigned long chunk_size;
 
         snprintf(buf, SEND_BUFFER_SIZE,
                  "<tr><td><a href=\"%s\">%s</a></td></tr>\r\n", name, name);
-        http_server_send(tracer->socket, buf, strlen(buf));
+
+        // Calculate chunk size
+        chunk_size = strlen(buf);
+        // Prepare chunk header
+        snprintf(chunk_header, sizeof(chunk_header), "%lu\r\n", chunk_size);
+        // Send chunk header
+        http_server_send(tracer->socket, chunk_header, strlen(chunk_header));
+        // Send chunk data
+        http_server_send(tracer->socket, buf, chunk_size);
+        // Send CRLF
+        http_server_send(tracer->socket, CRLF, strlen(CRLF));
     }
 
     return true;
@@ -124,7 +148,7 @@ static bool trace_directory(struct dir_context *dir_context,
 
 
 
-static void directory_listing(struct http_request *request)
+static void directory_listing(struct http_request *request, struct file *fp)
 {
     struct dir_tracer d_tracer = {
         .dir_context =
@@ -134,31 +158,51 @@ static void directory_listing(struct http_request *request)
         .socket = request->socket,
     };
 
-    struct file *fp;
     char buf[SEND_BUFFER_SIZE] = {0};
 
-    fp = filp_open("/home/xiang/Desktop/linux2024/khttpd", O_RDONLY, 0);
-
-    if (IS_ERR(fp)) {
-        pr_info("Open file failed");
-        return;
-    }
-
-    snprintf(buf, SEND_BUFFER_SIZE, HTTP_RESPONSE_200_KEEPALIVE_HTML);
+    // send header
+    snprintf(buf, SEND_BUFFER_SIZE, HTTP_RESPONSE_200_CHUNKED_KEEPALIVE,
+             "text/html");
     http_server_send(request->socket, buf, strlen(buf));
-    snprintf(buf, SEND_BUFFER_SIZE, "%s%s%s%s", "<html><head><style>\r\n",
+
+    // send html header
+    snprintf(buf, SEND_BUFFER_SIZE, "7B\r\n%s%s%s%s", "<html><head><style>\r\n",
              "body{font-family: monospace; font-size: 15px;}\r\n",
              "td {padding: 1.5px 6px;}\r\n",
              "</style></head><body><table>\r\n");
     http_server_send(request->socket, buf, strlen(buf));
 
     iterate_dir(fp, &d_tracer.dir_context);
-    snprintf(buf, SEND_BUFFER_SIZE, "</table></body></html>\r\n");
+    snprintf(buf, SEND_BUFFER_SIZE, "16\r\n</table></body></html>\r\n");
+    http_server_send(request->socket, buf, strlen(buf));
+
+    // Sending the final chunk to indicate the end of the chunked transfer
+    // encoding
+    snprintf(buf, SEND_BUFFER_SIZE, "0\r\n\r\n\r\n");
     http_server_send(request->socket, buf, strlen(buf));
     filp_close(fp, NULL);
 
     return;
 }
+
+
+static int file_content_response(struct http_request *request, struct file *fp)
+{
+    char *read_data = kmalloc(fp->f_inode->i_size, GFP_KERNEL);
+    int ret = kernel_read(fp, read_data, fp->f_inode->i_size, 0);
+    char buf[SEND_BUFFER_SIZE] = {0};
+
+    snprintf(buf, SEND_BUFFER_SIZE, HTTP_RESPONSE_200_KEEPALIVE,
+             get_mime_str(request->request_url), ret);
+    pr_info("Response Header content %s ! : ", buf);
+    http_server_send(request->socket, buf, strlen(buf));
+    http_server_send(request->socket, read_data, ret);
+
+    kfree(read_data);
+    return 0;
+}
+
+
 
 static int http_server_response(struct http_request *request, int keep_alive)
 {
@@ -167,10 +211,36 @@ static int http_server_response(struct http_request *request, int keep_alive)
         char *response =
             keep_alive ? HTTP_RESPONSE_501_KEEPALIVE : HTTP_RESPONSE_501;
         http_server_send(request->socket, response, strlen(response));
+    } else {
+        char filepath[256];
+        char *path = "/home/xiang/Desktop/linux2024/khttpd";
+        snprintf(filepath, sizeof(filepath), "%s%s", path,
+                 request->request_url);
+        pr_info("request path ! %s\n", filepath);
+
+        struct file *fp = filp_open(filepath, O_RDONLY, 0);
+        if (IS_ERR(fp)) {
+            pr_info("Open file failed");
+            pr_err("request resouce not found ! \n");
+            http_server_send(request->socket, HTTP_RESPONSE_404,
+                             strlen(HTTP_RESPONSE_404));
+        }
+
+        // response directory list
+        else if (S_ISDIR(fp->f_inode->i_mode)) {
+            directory_listing(request, fp);
+        }
+
+        // response file content
+        else if (S_ISREG(fp->f_inode->i_mode)) {
+            file_content_response(request, fp);
+        } else {
+            pr_err("request resouce not found ! \n");
+            http_server_send(request->socket, HTTP_RESPONSE_404,
+                             strlen(HTTP_RESPONSE_404));
+        }
+        filp_close(fp, NULL);
     }
-    // response current directory list
-    else
-        directory_listing(request);
     return 0;
 }
 
@@ -357,6 +427,11 @@ int handle_client_request(void *arg, struct workqueue_struct *workqueue)
 
 int http_server_daemon(void *arg)
 {
+    /*
+    pr_err("test %s", HTTP_RESPONSE_200_CHUNKED_KEEPALIVE);
+    return 0;
+    */
+
     struct workqueue_struct *workqueue =
         alloc_workqueue("khttp", 0, WQ_MAX_ACTIVE);
 
