@@ -133,8 +133,8 @@ static bool trace_directory(struct dir_context *dir_context,
 
         // Calculate chunk size
         chunk_size = strlen(buf);
-        // Prepare chunk header
-        snprintf(chunk_header, sizeof(chunk_header), "%lu\r\n", chunk_size);
+        // Prepare chunk headerf
+        snprintf(chunk_header, sizeof(chunk_header), "%lx\r\n", chunk_size);
         // Send chunk header
         http_server_send(tracer->socket, chunk_header, strlen(chunk_header));
         // Send chunk data
