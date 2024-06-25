@@ -180,7 +180,7 @@ static void directory_listing(struct http_request *request, struct file *fp)
     // encoding
     snprintf(buf, SEND_BUFFER_SIZE, "0\r\n\r\n\r\n");
     http_server_send(request->socket, buf, strlen(buf));
-    filp_close(fp, NULL);
+
 
     return;
 }
@@ -224,6 +224,7 @@ static int http_server_response(struct http_request *request, int keep_alive)
             pr_err("request resouce not found ! \n");
             http_server_send(request->socket, HTTP_RESPONSE_404,
                              strlen(HTTP_RESPONSE_404));
+            return 0;
         }
 
         // response directory list
@@ -406,6 +407,13 @@ int handle_client_request(void *arg, struct workqueue_struct *workqueue)
 {
     struct request_handler *handler =
         kmalloc(sizeof(struct request_handler), GFP_KERNEL);
+
+    if (!handler) {
+        pr_err("can't allocate memory for request_handler\n");
+        return 0;
+    }
+
+
     handler->socket = arg;
     INIT_WORK(&handler->w, http_server_worker);
     if (queue_work(workqueue, &handler->w) == 0) {
@@ -434,6 +442,11 @@ int http_server_daemon(void *arg)
 
     struct workqueue_struct *workqueue =
         alloc_workqueue("khttp", 0, WQ_MAX_ACTIVE);
+
+    if (!workqueue) {
+        pr_err("can't allocate memory for workqueue\n");
+        return -1;
+    }
 
 
     struct socket *socket;
